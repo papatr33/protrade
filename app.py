@@ -7,6 +7,7 @@ import yfinance as yf
 import re
 from datetime import datetime, timedelta
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="ProTrade Portfolio Engine", layout="wide", initial_sidebar_state="expanded")
@@ -132,15 +133,19 @@ def load_and_process_data(soy_file, trade_file):
     return soy, trades
 
 @st.cache_data
-def fetch_market_data(ticker, currency):
+def fetch_market_data(ticker, currency, _show_warnings=True):
     start_date = "2024-12-20"
     end_date = datetime.now().strftime('%Y-%m-%d')
     
     try:
         # Fetch Stock Data
         stock_raw = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
-        if stock_raw.empty: return None, None, None, None
-        if isinstance(stock_raw.columns, pd.MultiIndex): stock_raw.columns = stock_raw.columns.get_level_values(0)
+        
+        if stock_raw is None or stock_raw.empty:
+            return None, None, None, None, f"No data returned for {ticker}"
+            
+        if isinstance(stock_raw.columns, pd.MultiIndex): 
+            stock_raw.columns = stock_raw.columns.get_level_values(0)
         
         valid_dates = stock_raw.index
         
@@ -159,12 +164,13 @@ def fetch_market_data(ticker, currency):
         fx_ticker = normalize_fx_pair(currency)
         if fx_ticker:
             fx_raw = yf.download(fx_ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(fx_raw.columns, pd.MultiIndex): fx_raw.columns = fx_raw.columns.get_level_values(0)
+            if isinstance(fx_raw.columns, pd.MultiIndex): 
+                fx_raw.columns = fx_raw.columns.get_level_values(0)
             fx_filled = fx_raw['Close'].reindex(all_dates).ffill().bfill()
             
-        return stock_filled, fx_filled, valid_dates, company_name
-    except:
-        return None, None, None, None
+        return stock_filled, fx_filled, valid_dates, company_name, None
+    except Exception as e:
+        return None, None, None, None, f"Error fetching data for {ticker}: {str(e)}"
 
 # --- 3. CORE CALCULATION ---
 
@@ -417,7 +423,11 @@ if soy_file and trade_file:
                 selected_ticker = st.selectbox("Select Ticker to Analyze", all_tickers)
             
             if selected_ticker:
-                s_df, f_df, valid_dates, c_name = fetch_market_data(selected_ticker, soy_df[soy_df['YF_Ticker'] == selected_ticker]['Currency'].iloc[0] if selected_ticker in soy_df['YF_Ticker'].values else trade_df[trade_df['YF_Ticker'] == selected_ticker]['Currency'].iloc[0])
+                currency = soy_df[soy_df['YF_Ticker'] == selected_ticker]['Currency'].iloc[0] if selected_ticker in soy_df['YF_Ticker'].values else trade_df[trade_df['YF_Ticker'] == selected_ticker]['Currency'].iloc[0]
+                s_df, f_df, valid_dates, c_name, error = fetch_market_data(selected_ticker, currency)
+                
+                if error:
+                    st.warning(error)
                 
                 if s_df is not None:
                     analysis, s_trades, o_trades, _ = calculate_ticker_metrics(selected_ticker, soy_df, trade_df, s_df, f_df, c_name)
@@ -443,24 +453,54 @@ if soy_file and trade_file:
 
         with tab2:
             if st.session_state['portfolio_summary'] is None:
-                st.info("Click below to run the full portfolio analysis (Takes ~30-60s).")
+                st.info("Click below to run the full portfolio analysis (Parallel fetch - typically 10-20s).")
                 if st.button("Generate Portfolio Report"):
                     summary_list = []
                     history_list = []
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
-                    for i, ticker in enumerate(all_tickers):
-                        status_text.text(f"Analyzing {ticker}...")
-                        currency = soy_df[soy_df['YF_Ticker'] == ticker]['Currency'].iloc[0] if ticker in soy_df['YF_Ticker'].values else trade_df[trade_df['YF_Ticker'] == ticker]['Currency'].iloc[0]
-                        s_df, f_df, _, c_name = fetch_market_data(ticker, currency) 
-                        
+                    # Build ticker -> currency mapping
+                    ticker_currency_map = {}
+                    for ticker in all_tickers:
+                        if ticker in soy_df['YF_Ticker'].values:
+                            ticker_currency_map[ticker] = soy_df[soy_df['YF_Ticker'] == ticker]['Currency'].iloc[0]
+                        else:
+                            ticker_currency_map[ticker] = trade_df[trade_df['YF_Ticker'] == ticker]['Currency'].iloc[0]
+                    
+                    # Helper function for parallel processing
+                    def process_ticker(ticker):
+                        currency = ticker_currency_map[ticker]
+                        s_df, f_df, _, c_name, error = fetch_market_data(ticker, currency)
                         if s_df is not None:
                             analysis_df, _, _, stats = calculate_ticker_metrics(ticker, soy_df, trade_df, s_df, f_df, c_name)
-                            summary_list.append(stats)
-                            history_list.append(analysis_df)
+                            return (analysis_df, stats, None)
+                        return (None, None, error)
+                    
+                    # Parallel fetch with ThreadPoolExecutor
+                    completed = 0
+                    total = len(all_tickers)
+                    status_text.text(f"Fetching data for {total} tickers in parallel...")
+                    
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        future_to_ticker = {executor.submit(process_ticker, ticker): ticker for ticker in all_tickers}
+                        
+                        for future in as_completed(future_to_ticker):
+                            ticker = future_to_ticker[future]
+                            completed += 1
+                            progress_bar.progress(completed / total)
+                            status_text.text(f"Completed {completed}/{total}: {ticker}")
                             
-                        progress_bar.progress((i + 1) / len(all_tickers))
+                            try:
+                                result = future.result()
+                                analysis_df, stats, error = result
+                                if analysis_df is not None:
+                                    summary_list.append(stats)
+                                    history_list.append(analysis_df)
+                                elif error:
+                                    st.warning(error)
+                            except Exception as e:
+                                st.warning(f"Error processing {ticker}: {e}")
                     
                     st.session_state['portfolio_summary'] = pd.DataFrame(summary_list)
                     st.session_state['full_history_df'] = pd.concat(history_list) if history_list else pd.DataFrame()
