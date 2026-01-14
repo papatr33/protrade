@@ -37,6 +37,16 @@ st.markdown("""
 
 # --- 1. PARSING & UTILS ---
 
+def get_china_ticker_suffix(symbol):
+    """Determine the correct suffix for China A-share tickers.
+    Shanghai (.SS): starts with 6, 9 (B-shares), or 5 (ETFs/funds)
+    Shenzhen (.SZ): starts with 0, 3 (ChiNext), 2 (B-shares), or 1 (funds)
+    """
+    if symbol.startswith(('6', '9', '5')):
+        return f"{symbol}.SS"
+    else:  # 0, 1, 2, 3 prefixes go to Shenzhen
+        return f"{symbol}.SZ"
+
 def parse_ticker_info(bb_key):
     if pd.isna(bb_key): return None, None, 'USD'
     bb_key = str(bb_key).strip()
@@ -51,7 +61,7 @@ def parse_ticker_info(bb_key):
         symbol, country = match.groups()
         if country == 'US': yf_ticker = symbol; currency = 'USD'
         elif country == 'HK': yf_ticker = f"{symbol.zfill(4)}.HK"; currency = 'HKD'
-        elif country == 'CH': yf_ticker = f"{symbol}.SS" if symbol.startswith('6') else f"{symbol}.SZ"; currency = 'CNY'
+        elif country == 'CH': yf_ticker = get_china_ticker_suffix(symbol); currency = 'CNY'
         elif country == 'JP': yf_ticker = f"{symbol}.T"; currency = 'JPY'
         elif country == 'LN': yf_ticker = f"{symbol}.L"; currency = 'GBP'
     
@@ -59,7 +69,7 @@ def parse_ticker_info(bb_key):
         parts = bb_key.split()
         raw_sym = parts[0]
         if ' HK ' in bb_key: yf_ticker = f"{raw_sym.zfill(4)}.HK"; currency = 'HKD'
-        elif ' CH ' in bb_key: yf_ticker = f"{raw_sym}.SS" if raw_sym.startswith('6') else f"{raw_sym}.SZ"; currency = 'CNY'
+        elif ' CH ' in bb_key: yf_ticker = get_china_ticker_suffix(raw_sym); currency = 'CNY'
         else: yf_ticker = raw_sym; currency = 'USD'
 
     return yf_ticker, asset_type, currency
@@ -130,22 +140,67 @@ def load_and_process_data(soy_file, trade_file):
     trades['USD_Cashflow'] = abs_proceeds * trades.apply(get_cashflow_sign, axis=1)
     trades['Price_Local'] = pd.to_numeric(trades['Trade Price'], errors='coerce').fillna(0)
     
-    return soy, trades
+    # Determine analysis start date from earliest trade date
+    earliest_trade_date = trades['Trade Date'].min()
+    # The SOY file represents positions as of one day BEFORE the first trade date
+    # So analysis starts from the day before the earliest trade
+    analysis_start_date = (earliest_trade_date - timedelta(days=1)).strftime('%Y-%m-%d')
+    
+    return soy, trades, analysis_start_date
+
+def flatten_yf_dataframe(df, ticker):
+    """Flatten yfinance DataFrame to ensure single-level columns with correct data."""
+    if df is None or df.empty:
+        return df
+    
+    # Handle MultiIndex columns (yfinance returns this for single ticker too sometimes)
+    if isinstance(df.columns, pd.MultiIndex):
+        # Try to get data for this specific ticker first
+        try:
+            # MultiIndex is usually (Price, Ticker) - try to extract just this ticker's data
+            if ticker in df.columns.get_level_values(1):
+                df = df.xs(ticker, level=1, axis=1)
+            else:
+                # Fallback: just take the first level (price names)
+                df.columns = df.columns.get_level_values(0)
+        except:
+            df.columns = df.columns.get_level_values(0)
+    
+    # Remove any duplicate columns by keeping only the first occurrence
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    return df
 
 @st.cache_data
-def fetch_market_data(ticker, currency, _show_warnings=True):
-    start_date = "2024-12-20"
+def fetch_market_data(ticker, currency, analysis_start_date, _show_warnings=True):
+    # Use the dynamic analysis start date from uploaded files
+    start_date = analysis_start_date
     end_date = datetime.now().strftime('%Y-%m-%d')
     
     try:
-        # Fetch Stock Data
-        stock_raw = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
+        # Fetch Stock Data - use threads=False to prevent data mixing in concurrent calls
+        stock_raw = yf.download(
+            ticker, 
+            start=start_date, 
+            end=end_date, 
+            progress=False, 
+            auto_adjust=True,
+            threads=False  # Prevents internal threading issues that cause data mixing
+        )
         
         if stock_raw is None or stock_raw.empty:
             return None, None, None, None, f"No data returned for {ticker}"
-            
-        if isinstance(stock_raw.columns, pd.MultiIndex): 
-            stock_raw.columns = stock_raw.columns.get_level_values(0)
+        
+        # Flatten MultiIndex and handle duplicate columns
+        stock_raw = flatten_yf_dataframe(stock_raw, ticker)
+        
+        # Ensure we have the required columns as Series, not DataFrames
+        required_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for col in required_cols:
+            if col in stock_raw.columns:
+                # If column is still a DataFrame (duplicates), take only the first
+                if isinstance(stock_raw[col], pd.DataFrame):
+                    stock_raw[col] = stock_raw[col].iloc[:, 0]
         
         valid_dates = stock_raw.index
         
@@ -163,16 +218,36 @@ def fetch_market_data(ticker, currency, _show_warnings=True):
         fx_filled = None
         fx_ticker = normalize_fx_pair(currency)
         if fx_ticker:
-            fx_raw = yf.download(fx_ticker, start=start_date, end=end_date, progress=False)
-            if isinstance(fx_raw.columns, pd.MultiIndex): 
-                fx_raw.columns = fx_raw.columns.get_level_values(0)
-            fx_filled = fx_raw['Close'].reindex(all_dates).ffill().bfill()
+            fx_raw = yf.download(
+                fx_ticker, 
+                start=start_date, 
+                end=end_date, 
+                progress=False,
+                threads=False
+            )
+            if fx_raw is not None and not fx_raw.empty:
+                fx_raw = flatten_yf_dataframe(fx_raw, fx_ticker)
+                close_col = fx_raw['Close']
+                # Ensure it's a Series
+                if isinstance(close_col, pd.DataFrame):
+                    close_col = close_col.iloc[:, 0]
+                fx_filled = close_col.reindex(all_dates).ffill().bfill()
             
         return stock_filled, fx_filled, valid_dates, company_name, None
     except Exception as e:
         return None, None, None, None, f"Error fetching data for {ticker}: {str(e)}"
 
 # --- 3. CORE CALCULATION ---
+
+def safe_get_column(df, col_name):
+    """Safely extract a column as a Series, handling DataFrame/MultiIndex edge cases."""
+    if col_name not in df.columns:
+        return pd.Series(index=df.index, dtype=float)
+    col = df[col_name]
+    # If it's a DataFrame (duplicate columns), take the first column
+    if isinstance(col, pd.DataFrame):
+        return col.iloc[:, 0]
+    return col
 
 def calculate_ticker_metrics(ticker, soy, trades, stock_df, fx_df, company_name):
     t_soy = soy[soy['YF_Ticker'] == ticker]
@@ -181,10 +256,11 @@ def calculate_ticker_metrics(ticker, soy, trades, stock_df, fx_df, company_name)
 
     dates = stock_df.index
     analysis = pd.DataFrame(index=dates)
-    analysis['Close_Local'] = stock_df['Close']
-    analysis['Open'] = stock_df['Open']
-    analysis['High'] = stock_df['High']
-    analysis['Low'] = stock_df['Low']
+    # Use safe_get_column to handle potential DataFrame/duplicate column issues
+    analysis['Close_Local'] = safe_get_column(stock_df, 'Close')
+    analysis['Open'] = safe_get_column(stock_df, 'Open')
+    analysis['High'] = safe_get_column(stock_df, 'High')
+    analysis['Low'] = safe_get_column(stock_df, 'Low')
     
     if currency == 'GBP':
         analysis['Close_Local'] = analysis['Close_Local'] / 100.0
@@ -271,8 +347,9 @@ def calculate_ticker_metrics(ticker, soy, trades, stock_df, fx_df, company_name)
 
 # --- 4. PLOTTING ---
 
-def plot_ticker_deep_dive(ticker, df_analysis, stock_trades, opt_trades, valid_dates):
-    df_view = df_analysis[df_analysis.index >= '2025-01-01']
+def plot_ticker_deep_dive(ticker, df_analysis, stock_trades, opt_trades, valid_dates, display_start_date):
+    # Use dynamic display start date based on uploaded files
+    df_view = df_analysis[df_analysis.index >= display_start_date]
     df_price_plot = df_view.loc[df_view.index.intersection(valid_dates)]
 
     fig = make_subplots(
@@ -405,10 +482,29 @@ st.sidebar.title("📁 Data Import")
 soy_file = st.sidebar.file_uploader("Soy Positions (CSV)", type=['csv'])
 trade_file = st.sidebar.file_uploader("Trade Record (CSV)", type=['csv'])
 
+# Add cache clear button for troubleshooting stale data
+if st.sidebar.button("🔄 Clear Price Cache"):
+    fetch_market_data.clear()
+    load_and_process_data.clear()
+    if 'portfolio_summary' in st.session_state:
+        st.session_state['portfolio_summary'] = None
+    if 'full_history_df' in st.session_state:
+        st.session_state['full_history_df'] = None
+    st.sidebar.success("Cache cleared! Data will be re-fetched.")
+    st.rerun()
+
 if soy_file and trade_file:
     try:
-        soy_df, trade_df = load_and_process_data(soy_file, trade_file)
+        soy_df, trade_df, analysis_start_date = load_and_process_data(soy_file, trade_file)
         all_tickers = sorted(list(set(soy_df['YF_Ticker'].dropna()) | set(trade_df['YF_Ticker'].dropna())))
+        
+        # Store analysis start date in session state for reference
+        st.session_state['analysis_start_date'] = analysis_start_date
+        
+        # Display analysis period info in sidebar
+        display_start = (datetime.strptime(analysis_start_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%b %d, %Y')
+        display_end = datetime.now().strftime('%b %d, %Y')
+        st.sidebar.success(f"📅 Analysis Period: **{display_start}** to **{display_end}**")
         
         if 'portfolio_summary' not in st.session_state:
             st.session_state['portfolio_summary'] = None
@@ -424,7 +520,7 @@ if soy_file and trade_file:
             
             if selected_ticker:
                 currency = soy_df[soy_df['YF_Ticker'] == selected_ticker]['Currency'].iloc[0] if selected_ticker in soy_df['YF_Ticker'].values else trade_df[trade_df['YF_Ticker'] == selected_ticker]['Currency'].iloc[0]
-                s_df, f_df, valid_dates, c_name, error = fetch_market_data(selected_ticker, currency)
+                s_df, f_df, valid_dates, c_name, error = fetch_market_data(selected_ticker, currency, analysis_start_date)
                 
                 if error:
                     st.warning(error)
@@ -444,7 +540,9 @@ if soy_file and trade_file:
                     with c3: st.markdown(get_metric_html("Option PnL", curr_opt), unsafe_allow_html=True)
                     with c4: st.markdown(get_metric_html("Current Position", analysis['Stock_Pos'].iloc[-1], is_currency=False), unsafe_allow_html=True)
                     
-                    st.plotly_chart(plot_ticker_deep_dive(selected_ticker, analysis, s_trades, o_trades, valid_dates), use_container_width=True)
+                    # Display starts from the first trade date (day after SOY)
+                    display_start = (datetime.strptime(analysis_start_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+                    st.plotly_chart(plot_ticker_deep_dive(selected_ticker, analysis, s_trades, o_trades, valid_dates, display_start), use_container_width=True)
                     
                     with st.expander("View Trade Log"):
                          st.dataframe(trade_df[trade_df['YF_Ticker'] == selected_ticker].sort_values('Trade Date', ascending=False))
@@ -471,7 +569,7 @@ if soy_file and trade_file:
                     # Helper function for parallel processing
                     def process_ticker(ticker):
                         currency = ticker_currency_map[ticker]
-                        s_df, f_df, _, c_name, error = fetch_market_data(ticker, currency)
+                        s_df, f_df, _, c_name, error = fetch_market_data(ticker, currency, analysis_start_date)
                         if s_df is not None:
                             analysis_df, _, _, stats = calculate_ticker_metrics(ticker, soy_df, trade_df, s_df, f_df, c_name)
                             return (analysis_df, stats, None)
@@ -534,12 +632,16 @@ if soy_file and trade_file:
                 if st.button("Refresh Data"):
                     st.session_state['portfolio_summary'] = None
                     st.session_state['full_history_df'] = None
+                    # Clear the market data cache to fetch fresh prices
+                    fetch_market_data.clear()
                     st.rerun()
 
         with tab3:
             if st.session_state['full_history_df'] is not None and not st.session_state['full_history_df'].empty:
                 hist_df = st.session_state['full_history_df']
-                hist_df = hist_df[hist_df.index >= '2025-01-01']
+                # Filter to display from first trade date (day after SOY)
+                display_start = (datetime.strptime(analysis_start_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+                hist_df = hist_df[hist_df.index >= display_start]
                 f1, f2 = plot_portfolio_performance(hist_df)
                 st.plotly_chart(f1, use_container_width=True)
                 st.plotly_chart(f2, use_container_width=True)
